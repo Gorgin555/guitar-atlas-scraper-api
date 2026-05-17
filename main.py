@@ -31,7 +31,7 @@ logger = logging.getLogger("atlas-scraper-api")
 # -- Environment ---------------------------------------------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
-REVERB_TOKEN = os.environ.get("REVERB_PERSONAL_TOKEN", "")
+REVERB_TOKEN = os.environ.get("REVERB_TOKEN", "")
 REVERB_API_BASE = os.environ.get("REVERB_API_BASE", "https://api.reverb.com/api")
 REVERB_USER_AGENT = os.environ.get(
     "REVERB_USER_AGENT", "GuitarAtlas/0.1 (contact: i49rake@gmail.com)"
