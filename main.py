@@ -1,495 +1,573 @@
 """
-GUITAR ATLAS -- Scraper API (FastAPI) v2.1
-==========================================
-Standalone FastAPI service for n8n orchestration.
-- Uses httpx for Supabase REST API (no supabase-py, supports sb_secret_* keys)
-- Uses httpx for Reverb API
-- Fully self-contained (no imports from local ingest/scrapers modules)
+GUITAR ATLAS — Scraper API (FastAPI)
+=====================================
+n8n から呼び出す Python オーケストレーションサービス。
+Reverb/デジマート/Yahoo スクレイパー + Index Engine + Claude 記事シード生成を
+HTTP エンドポイントとして提供する。
 
-Author: COO Dream
-Updated: 2026-05-17 -- Fix: supabase-py removed, httpx REST client
+担当: COO ドレアム
+作成: 2026-05-15
+v1.1 (2026-05-17): 根幹安定化リファクタ
+  - Supabase / Reverb / scrapers の初期化を遅延化（health は env なしでも 200）
+  - 既存 CLI 関数（run_active / PassiveCollector.run / fetch_and_upsert / run_engine）に委譲
+  - on_conflict / 列名 (brand_name / is_passive) / async 呼び出しを実装と一致
+  - /index/run が index_snapshots に加えて index_daily へピボット書込
 """
+from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
-import time
-from collections import defaultdict
+import sys
 from datetime import date, datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
-import httpx
-from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-load_dotenv()
+# ── パス解決（同一プロジェクトのコードを参照）──────────────────────────
+_HERE = os.path.dirname(__file__)
+_CODE_DIR = os.path.abspath(os.path.join(_HERE, ".."))         # → code/n8n
+_ATLAS_CODE = os.path.abspath(os.path.join(_HERE, "..", ".."))   # → code/
+sys.path.insert(0, _ATLAS_CODE)
+
+# .env は Railway では存在しない。ローカル開発時のみ読み込めればよい。
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(_ATLAS_CODE, ".env"))
+except Exception:  # pragma: no cover
+    pass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("atlas-scraper-api")
 
-# -- Environment ---------------------------------------------------------------
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
-REVERB_TOKEN = os.environ.get("REVERB_TOKEN", "")
-REVERB_API_BASE = os.environ.get("REVERB_API_BASE", "https://api.reverb.com/api")
-REVERB_USER_AGENT = os.environ.get(
-    "REVERB_USER_AGENT", "GuitarAtlas/0.1 (contact: i49rake@gmail.com)"
-)
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# ── セキュリティ ────────────────────────────────────────────────────────
 ATLAS_API_SECRET = os.environ.get("ATLAS_API_SECRET", "")
 
 
-# -- Security ------------------------------------------------------------------
-def verify_secret(x_atlas_secret: str = Header(...)):
-    if ATLAS_API_SECRET and x_atlas_secret != ATLAS_API_SECRET:
+def verify_secret(x_atlas_secret: Optional[str] = Header(default=None)):
+    """n8n との共有シークレットで認証。未設定時はオープン（CEO の手動テスト用）。"""
+    if not ATLAS_API_SECRET:
+        return True
+    if x_atlas_secret != ATLAS_API_SECRET:
         raise HTTPException(status_code=403, detail="Invalid API secret")
     return True
 
 
-# -- Supabase REST helpers (no supabase-py needed) ----------------------------
-
-def _sb_headers(prefer: str = "") -> dict:
-    h = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "Content-Type": "application/json",
-    }
-    if prefer:
-        h["Prefer"] = prefer
-    return h
+# ── Supabase クライアント（遅延初期化）────────────────────────────────
+_supabase_client = None
 
 
-def sb_select(
-    table: str,
-    select: str = "*",
-    filters: Optional[dict] = None,
-    order: Optional[str] = None,
-    limit: Optional[int] = None,
-) -> list:
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
-    params: dict = {"select": select}
-    if filters:
-        params.update(filters)
-    if order:
-        params["order"] = order
-    if limit is not None:
-        params["limit"] = str(limit)
-    r = httpx.get(url, headers=_sb_headers(), params=params, timeout=60)
-    r.raise_for_status()
-    return r.json()
+def get_supabase():
+    """
+    Supabase クライアントを遅延生成して返す。
+    起動時に env が無くてもプロセスは落ちないよう、最初の呼び出し時に作る。
+    """
+    global _supabase_client
+    if _supabase_client is None:
+        from supabase import create_client
 
-
-def sb_upsert(table: str, rows: list, on_conflict: str = "") -> None:
-    if not rows:
-        return
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
-    params: dict = {}
-    if on_conflict:
-        params["on_conflict"] = on_conflict
-    r = httpx.post(
-        url,
-        json=rows,
-        headers=_sb_headers("resolution=merge-duplicates,return=minimal"),
-        params=params,
-        timeout=60,
-    )
-    r.raise_for_status()
-
-
-# -- Reverb API client ---------------------------------------------------------
-
-def reverb_search(
-    query: str,
-    state: str = "live",
-    per_page: int = 50,
-    max_pages: int = 3,
-) -> list:
-    headers = {
-        "Authorization": f"Bearer {REVERB_TOKEN}",
-        "Accept": "application/hal+json",
-        "Accept-Version": "3.0",
-        "Content-Type": "application/hal+json",
-        "User-Agent": REVERB_USER_AGENT,
-    }
-    params = {"query": query, "per_page": per_page, "page": 1}
-    if state and state != "live":
-        params["state"] = state
-
-    all_listings = []
-    next_url: Optional[str] = None
-
-    for _ in range(max_pages):
-        time.sleep(1.0)
-        if next_url:
-            r = httpx.get(next_url, headers=headers, timeout=30)
-        else:
-            r = httpx.get(
-                f"{REVERB_API_BASE}/listings", headers=headers, params=params, timeout=30
+        url = os.environ.get("SUPABASE_URL")
+        key = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY")
+        if not (url and key):
+            raise HTTPException(
+                status_code=503,
+                detail="Supabase credentials not configured (SUPABASE_URL / SUPABASE_SERVICE_KEY)",
             )
-
-        if r.status_code == 429:
-            retry_after = int(r.headers.get("Retry-After", "10"))
-            logger.warning("Reverb 429 -- sleeping %ds", retry_after)
-            time.sleep(retry_after)
-            continue
-        r.raise_for_status()
-
-        data = r.json()
-        all_listings.extend(data.get("listings") or [])
-        links = data.get("_links") or {}
-        next_url = (links.get("next") or {}).get("href")
-        if not next_url:
-            break
-
-    return all_listings
+        _supabase_client = create_client(url, key)
+    return _supabase_client
 
 
-# -- FastAPI App ---------------------------------------------------------------
-app = FastAPI(title="GUITAR ATLAS Scraper API", version="2.1.0")
+# ── FastAPI App ──────────────────────────────────────────────────────────
+app = FastAPI(
+    title="GUITAR ATLAS Scraper API",
+    description="n8n オーケストレーション用 Python バックエンド",
+    version="1.1.0",
+)
 
+
+# ═══════════════════════════════════════════════════════════════════
+# ヘルスチェック (常に 200 / ASCII only)
+# ═══════════════════════════════════════════════════════════════════
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+    """常に 200 を返す。Railway healthcheck はここを見ている。"""
+    return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
 
 
-# -- Reverb fetch --------------------------------------------------------------
+@app.get("/")
+def root():
+    return {"service": "atlas-scraper-api", "version": "1.1.0"}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Reverb API フェッチ
+# ═══════════════════════════════════════════════════════════════════
 
 class FetchReverbRequest(BaseModel):
-    basket: str = "active"
+    basket: str = "active"          # "active" | "MFI" | "VFI" | "BPI"
     max_pages_per_model: int = 3
     dry_run: bool = False
+    limit_models: Optional[int] = None
 
 
-_REVERB_COND_MAP = {
-    "Mint": "mint", "Excellent": "excellent", "Very Good": "very_good",
-    "Good": "good", "Fair": "fair", "Poor": "poor",
-    "Non Functioning": "non_functioning", "B-Stock": "b_stock", "Brand New": "brand_new",
-}
+def _reverb_basket_arg(req_basket: str) -> Optional[str]:
+    """API の basket 入力を fetch_listings.load_targets の basket 引数に変換。"""
+    b = (req_basket or "").upper()
+    if b in ("MFI", "VFI", "BPI"):
+        return b
+    # "active" / "all" → None で全件
+    return None
 
 
-def _parse_listing(listing: dict, product_id: str, snapshot_date: str) -> dict:
-    price = listing.get("price") or {}
-    price_str = price.get("amount")
-    currency = price.get("currency")
-    try:
-        price_float = float(price_str) if price_str else None
-    except (TypeError, ValueError):
-        price_float = None
-    price_usd = price_float if currency == "USD" else None
-    cond_raw = (listing.get("condition") or {}).get("display_name") or listing.get(
-        "condition_slug"
+def _do_fetch_reverb(req: FetchReverbRequest) -> dict[str, Any]:
+    from ingest.fetch_listings import fetch_and_upsert, load_targets
+
+    targets = load_targets(
+        basket=_reverb_basket_arg(req.basket),
+        limit=req.limit_models,
     )
-    cond_norm = _REVERB_COND_MAP.get(cond_raw or "")
-    loc = listing.get("location") or {}
-    shipping = listing.get("shipping") or {}
-    seller = listing.get("shop") or {}
-    src_url = ((listing.get("_links") or {}).get("web") or {}).get("href")
+    if not targets:
+        return {"targets": 0, "inserted": 0, "errors": 0, "note": "no targets"}
+
+    counts = fetch_and_upsert(
+        targets,
+        per_page=50,
+        max_pages=req.max_pages_per_model,
+        state="live",
+        dry_run=req.dry_run,
+    )
+    # 既存 CLI の counts キー（targets / listings / errors）→ 共通フォーマットに正規化
     return {
-        "source": "reverb",
-        "source_listing_id": str(listing.get("id") or ""),
-        "source_url": src_url,
-        "product_id": product_id,
-        "matched_confidence": 0.80,
-        "listed_at": listing.get("created_at"),
-        "sold_at": listing.get("sold_at"),
-        "is_sold": bool(listing.get("sold_at")),
-        "price_local": price_float,
-        "currency": currency,
-        "price_usd": price_usd,
-        "condition": cond_norm,
-        "condition_raw": cond_raw,
-        "condition_tags": [],
-        "location_country": shipping.get("local_pickup_country_code")
-        or loc.get("country_code"),
-        "location_region": loc.get("region"),
-        "seller_type": "dealer" if seller else "unknown",
-        "seller_name": seller.get("name"),
-        "title": listing.get("title"),
-        "snapshot_date": snapshot_date,
+        "targets": counts.get("targets", 0),
+        "inserted": counts.get("listings", 0),
+        "errors": counts.get("errors", 0),
     }
 
 
 @app.post("/fetch/reverb")
 async def fetch_reverb(req: FetchReverbRequest, _auth=Depends(verify_secret)):
+    """Reverb API → listings_daily upsert。既存 fetch_and_upsert に委譲。"""
     try:
-        filters: dict = {}
-        if req.basket == "active":
-            filters["is_passive"] = "eq.false"
-        elif req.basket == "passive":
-            filters["is_passive"] = "eq.true"
-
-        products = sb_select(
-            "products",
-            select="product_id,basket_id,brand_name,model,year_range_str",
-            filters=filters if filters else None,
-        )
-        logger.info(
-            "Reverb fetch: %d products (basket=%s)", len(products), req.basket
-        )
-
-        snapshot_date = date.today().isoformat()
-        total_listings = 0
-        errors = 0
-
-        for product in products:
-            query = f"{product['brand_name']} {product['model']}"
-            if product.get("year_range_str"):
-                query += f" {product['year_range_str']}"
-            try:
-                listings = reverb_search(query, max_pages=req.max_pages_per_model)
-                if req.dry_run:
-                    logger.info("[DRY RUN] %s -> %d listings", query, len(listings))
-                    continue
-                rows = [
-                    _parse_listing(l, product["product_id"], snapshot_date)
-                    for l in listings
-                ]
-                if rows:
-                    sb_upsert(
-                        "listings_daily",
-                        rows,
-                        on_conflict="source,source_listing_id,snapshot_date",
-                    )
-                    total_listings += len(rows)
-                logger.info("%s -> %d upserted", query, len(rows))
-            except Exception as e:
-                logger.warning("Reverb error for %s: %s", product.get("model"), e)
-                errors += 1
-
-        return {
-            "source": "reverb",
-            "success": True,
-            "products_scanned": len(products),
-            "listings_upserted": total_listings,
-            "errors": errors,
-        }
+        result = await asyncio.to_thread(_do_fetch_reverb, req)
+        logger.info("Reverb fetch complete: %s", result)
+        return {"source": "reverb", "success": True, **result}
     except Exception as e:
         logger.error("Reverb fetch error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# -- Digimart (stub) -----------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════
+# Digimart / Yahoo スクレイパー（run_active に委譲）
+# ═══════════════════════════════════════════════════════════════════
 
-class FetchDigimartRequest(BaseModel):
-    basket: str = "active"
+class FetchActiveRequest(BaseModel):
+    basket: Optional[str] = None       # "MFI" | "VFI" | "BPI" | None（全件）
+    max_pages: int = 3
     dry_run: bool = False
+    limit_models: Optional[int] = None
+    yahoo_mode: str = "active"          # active / sold / both（後方互換）
+
+
+def _scrapers_basket_arg(b: Optional[str]) -> Optional[str]:
+    if not b:
+        return None
+    bb = b.upper()
+    return bb if bb in ("MFI", "VFI", "BPI") else None
+
+
+def _do_run_active(sources: list[str], req: FetchActiveRequest) -> dict[str, Any]:
+    """既存 run_scrapers.run_active を呼び出す薄いラッパー。"""
+    from scrapers.run_scrapers import _load_active_targets, run_active
+
+    targets = _load_active_targets(
+        basket=_scrapers_basket_arg(req.basket),
+        limit=req.limit_models,
+    )
+    if not targets:
+        return {"targets": 0, "inserted": 0, "errors": 0, "note": "no targets"}
+
+    counts = run_active(
+        sources=sources,
+        targets=targets,
+        max_pages=req.max_pages,
+        dry_run=req.dry_run,
+    )
+    return {
+        "targets": counts.get("targets", len(targets)),
+        "inserted": counts.get("listings", 0),
+        "errors": counts.get("errors", 0),
+    }
 
 
 @app.post("/fetch/digimart")
-async def fetch_digimart(req: FetchDigimartRequest, _auth=Depends(verify_secret)):
-    return {
-        "source": "digimart",
-        "success": True,
-        "message": "Digimart scraper not deployed in cloud environment.",
-    }
-
-
-# -- Yahoo Auctions (stub) -----------------------------------------------------
-
-class FetchYahooRequest(BaseModel):
-    basket: str = "active"
-    mode: str = "active"
-    dry_run: bool = False
+async def fetch_digimart(req: FetchActiveRequest, _auth=Depends(verify_secret)):
+    """デジマート → listings_daily upsert。"""
+    try:
+        result = await asyncio.to_thread(_do_run_active, ["digimart"], req)
+        logger.info("Digimart fetch complete: %s", result)
+        return {"source": "digimart", "success": True, **result}
+    except Exception as e:
+        logger.error("Digimart fetch error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/fetch/yahoo")
-async def fetch_yahoo(req: FetchYahooRequest, _auth=Depends(verify_secret)):
+async def fetch_yahoo(req: FetchActiveRequest, _auth=Depends(verify_secret)):
+    """Yahoo オークション → listings_daily upsert。"""
+    try:
+        result = await asyncio.to_thread(_do_run_active, ["yahoo"], req)
+        logger.info("Yahoo fetch complete: %s", result)
+        return {"source": "yahoo", "success": True, **result}
+    except Exception as e:
+        logger.error("Yahoo fetch error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 受動的収集（Pedals / Acoustic / Amps / JBI）
+# ═══════════════════════════════════════════════════════════════════
+
+class FetchPassiveRequest(BaseModel):
+    sources: Optional[list[str]] = None      # None → ["digimart", "yahoo"]
+    max_pages_per_brand: int = 2
+    categories: Optional[list[str]] = None
+    dry_run: bool = False
+
+
+def _do_run_passive(req: FetchPassiveRequest) -> dict[str, Any]:
+    from scrapers.passive_collector import PassiveCollector
+
+    collector = PassiveCollector(dry_run=req.dry_run)
+    counts = collector.run(
+        sources=req.sources,
+        max_pages_per_brand=req.max_pages_per_brand,
+        categories=req.categories,
+    )
     return {
-        "source": "yahoo",
-        "success": True,
-        "message": "Yahoo Auctions scraper not deployed in cloud environment.",
+        "inserted": counts.get("total_listings", 0),
+        "errors": counts.get("errors", 0),
     }
 
 
-# -- Index run -----------------------------------------------------------------
+@app.post("/fetch/passive")
+async def fetch_passive(
+    req: Optional[FetchPassiveRequest] = None,
+    _auth=Depends(verify_secret),
+):
+    """Phase 2-4 の受動的データ収集。body は省略可。"""
+    if req is None:
+        req = FetchPassiveRequest()
+    try:
+        result = await asyncio.to_thread(_do_run_passive, req)
+        logger.info("Passive collection complete: %s", result)
+        return {"source": "passive", "success": True, **result}
+    except Exception as e:
+        logger.error("Passive collection error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Index Engine 実行
+# ═══════════════════════════════════════════════════════════════════
 
 class IndexRunRequest(BaseModel):
-    target_date: Optional[str] = None
+    target_date: Optional[str] = None    # "YYYY-MM-DD" / None=最新
     write_to_db: bool = True
+    simulation_mode: bool = False
+    method_version: str = "v1.0"
+
+
+def _pivot_report_to_index_daily(report) -> dict[str, Any]:
+    """
+    DailyIndexReport を index_daily (single-row-per-date) のフォーマットへピボット。
+    フィールドが無い場合は None。
+    """
+    indices = report.all_index_results()
+    spreads = getattr(report, "spreads", {}) or {}
+
+    def _val(name: str) -> Optional[float]:
+        idx = indices.get(name)
+        if idx is None:
+            return None
+        v = getattr(idx, "display_value", None) or getattr(idx, "calibrated_value", None) or getattr(idx, "raw_value", None)
+        return float(v) if v is not None else None
+
+    def _spread(name: str) -> Optional[float]:
+        sp = spreads.get(name)
+        if sp is None:
+            return None
+        r = getattr(sp, "ratio", None)
+        return float(r) if r is not None else None
+
+    total_listings = 0
+    models_with_data = 0
+    for idx in indices.values():
+        total_listings += int(getattr(idx, "total_listings", 0) or 0)
+        models_with_data = max(models_with_data, int(getattr(idx, "n_models_with_data", 0) or 0))
+
+    return {
+        "snapshot_date": report.snapshot_date.isoformat(),
+        "gai_e": _val("GAI-E") if "GAI-E" in indices else _val("gai_e"),
+        "mfi": _val("MFI") if "MFI" in indices else _val("mfi"),
+        "vfi_ac": _val("VFI_AC") if "VFI_AC" in indices else _val("vfi_ac"),
+        "vfi_ao": _val("VFI_AO") if "VFI_AO" in indices else _val("vfi_ao"),
+        "bpi": _val("BPI") if "BPI" in indices else _val("bpi"),
+        "boutique_premium": _spread("BoutiquePremium") or _spread("boutique_premium"),
+        "vintage_premium":  _spread("VintagePremium")  or _spread("vintage_premium"),
+        "heritage_spread":  _spread("HeritageSpread")  or _spread("heritage_spread"),
+        "listings_count": total_listings or None,
+        "models_with_data": models_with_data or None,
+        "calibrated": bool(getattr(report, "is_calibrated", False)),
+    }
+
+
+def _do_run_index(req: IndexRunRequest) -> dict[str, Any]:
+    from index_engine.engine import run_engine
+
+    target = date.fromisoformat(req.target_date) if req.target_date else None
+    report = run_engine(
+        target_date=target,
+        dry_run=not req.write_to_db,
+        simulation_mode=req.simulation_mode,
+        method_version=req.method_version,
+        output_json=None,
+    )
+
+    # index_daily へのピボット書き込み（n8n / Slack が参照する単一行テーブル）
+    row = _pivot_report_to_index_daily(report)
+    if req.write_to_db:
+        try:
+            get_supabase().table("index_daily").upsert(
+                row, on_conflict="snapshot_date"
+            ).execute()
+        except Exception as e:
+            logger.warning("index_daily upsert failed (non-fatal): %s", e)
+
+    return {
+        "date": row["snapshot_date"],
+        "is_calibrated": bool(getattr(report, "is_calibrated", False)),
+        "indices": {
+            "gai_e": row.get("gai_e"),
+            "mfi": row.get("mfi"),
+            "vfi_ac": row.get("vfi_ac"),
+            "bpi": row.get("bpi"),
+        },
+        "spreads": {
+            "boutique_premium": row.get("boutique_premium"),
+            "vintage_premium": row.get("vintage_premium"),
+            "heritage_spread": row.get("heritage_spread"),
+        },
+    }
 
 
 @app.post("/index/run")
 async def run_index(req: IndexRunRequest, _auth=Depends(verify_secret)):
+    """GAI-E / MFI / VFI / BPI を計算し index_snapshots + index_daily に書き込む。"""
     try:
-        target = req.target_date or date.today().isoformat()
-
-        rows = sb_select(
-            "listings_daily",
-            select="product_id,price_usd,source,snapshot_date",
-            filters={"price_usd": "not.is.null"},
-            order="snapshot_date.desc",
-            limit=2000,
-        )
-
-        by_product: dict = defaultdict(list)
-        for row in rows:
-            if row.get("price_usd"):
-                by_product[row["product_id"]].append(float(row["price_usd"]))
-
-        models_with_data = len(by_product)
-
-        if req.write_to_db:
-            index_row = {
-                "snapshot_date": target,
-                "gai_e": None,
-                "mfi": None,
-                "vfi_ac": None,
-                "vfi_ao": None,
-                "bpi": None,
-                "listings_count": len(rows),
-                "models_with_data": models_with_data,
-                "calibrated": False,
-            }
-            try:
-                sb_upsert("index_daily", [index_row], on_conflict="snapshot_date")
-                logger.info(
-                    "index_daily upserted for %s (%d listings)", target, len(rows)
-                )
-            except Exception as e:
-                logger.warning("index_daily upsert failed (table may not exist): %s", e)
-
-        return {
-            "success": True,
-            "date": target,
-            "products_computed": models_with_data,
-            "listings_used": len(rows),
-        }
+        result = await asyncio.to_thread(_do_run_index, req)
+        logger.info("Index run complete: %s", result)
+        return {"success": True, **result}
     except Exception as e:
         logger.error("Index run error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/index/latest")
-async def get_latest_index(_auth=Depends(verify_secret)):
+def get_latest_index(_auth=Depends(verify_secret)):
+    """最新のインデックス値を index_daily から返す。"""
     try:
-        data = sb_select("index_daily", order="snapshot_date.desc", limit=1)
-        if not data:
-            raise HTTPException(status_code=404, detail="No index data found")
-        return data[0]
+        resp = (
+            get_supabase().table("index_daily")
+            .select("*")
+            .order("snapshot_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not resp.data:
+            raise HTTPException(status_code=404, detail="No index_daily rows yet")
+        return resp.data[0]
     except HTTPException:
         raise
     except Exception as e:
+        logger.error("get_latest_index error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# -- Content seeds -------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════
+# Claude 記事シード生成
+# ═══════════════════════════════════════════════════════════════════
 
 class SeedGenerationRequest(BaseModel):
     num_seeds: int = 3
-    language: str = "ja"
+    language: str = "ja"    # "ja" | "en"
+
+
+def _summarize_hot_models(listings: list[dict]) -> str:
+    if not listings:
+        return "データなし"
+    from collections import defaultdict
+    by_model: dict[str, list[float]] = defaultdict(list)
+    for row in listings:
+        key = f"{row.get('brand_name') or row.get('brand') or '?'} {row.get('model','?')}"
+        if row.get("price_usd"):
+            try:
+                by_model[key].append(float(row["price_usd"]))
+            except (TypeError, ValueError):
+                continue
+    lines = []
+    for model, prices in sorted(by_model.items(), key=lambda x: -len(x[1]))[:10]:
+        avg = sum(prices) / len(prices)
+        lines.append(f"- {model}: 平均 ${avg:,.0f}（{len(prices)}件）")
+    return "\n".join(lines) if lines else "データなし"
+
+
+def _strip_code_fence(text: str) -> str:
+    t = text.strip()
+    if "```" not in t:
+        return t
+    parts = t.split("```")
+    # 最も長いコードブロックを採用
+    candidates = [p for p in parts if p.strip()]
+    body = max(candidates, key=len) if candidates else t
+    # 先頭言語タグ除去
+    for tag in ("json\n", "json\r\n"):
+        if body.lstrip().lower().startswith(tag):
+            body = body.lstrip()[len(tag):]
+            break
+    return body.strip()
+
+
+def _do_generate_seeds(req: SeedGenerationRequest) -> dict[str, Any]:
+    import anthropic
+
+    sb = get_supabase()
+    idx_resp = (
+        sb.table("index_daily")
+        .select("*")
+        .order("snapshot_date", desc=True)
+        .limit(1)
+        .execute()
+    )
+    idx = idx_resp.data[0] if idx_resp.data else {}
+
+    hot_resp = (
+        sb.table("listings_daily")
+        .select("brand_name, model, price_usd, source, snapshot_date")
+        .order("snapshot_date", desc=True)
+        .limit(200)
+        .execute()
+    )
+    hot_summary = _summarize_hot_models(hot_resp.data or [])
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+
+    client = anthropic.Anthropic(api_key=api_key)
+    lang_instruction = (
+        "日本語で記述してください。" if req.language == "ja" else "Write in English."
+    )
+
+    prompt = f"""あなたは GUITAR ATLAS の Chief Strategy Officer です。
+本日（{date.today().isoformat()}）の市場データを基に、記事シードを{req.num_seeds}本生成してください。
+
+## 本日のインデックス値
+{json.dumps(idx, ensure_ascii=False, indent=2, default=str)}
+
+## 急騰・急落モデルサマリー
+{hot_summary}
+
+## 記事シードの要件
+各シードは以下のフィールドを含む JSON で返してください:
+- title: 記事タイトル（クリックされやすく、データ裏付けあり）
+- hook: リード文（2-3文、読者を引き込む）
+- key_data_points: 使用するデータポイント（配列、3-5個）
+- category: カテゴリ（"gai-e" | "vfi" | "bpi" | "boutique-premium" | "trend"）
+- tags: WordPress タグ（配列、"observed"|"indexed"|"spread"|"forecast"|"field-note"）
+- priority: 公開優先度（"high" | "medium" | "low"）
+- reason: このシードを選んだ理由（1文）
+
+{lang_instruction}
+
+JSONの配列として{req.num_seeds}本分のみ返してください。余計な説明不要。"""
+
+    message = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = message.content[0].text
+    try:
+        seeds = json.loads(_strip_code_fence(raw))
+    except json.JSONDecodeError as e:
+        logger.error("Claude returned invalid JSON: %s\nraw=%r", e, raw[:500])
+        raise HTTPException(status_code=502, detail=f"Claude JSON parse error: {e}")
+
+    if not isinstance(seeds, list):
+        raise HTTPException(status_code=502, detail="Claude response is not a JSON array")
+
+    today = date.today().isoformat()
+    rows = []
+    for s in seeds:
+        if not isinstance(s, dict):
+            continue
+        rows.append({
+            "generated_at": today,
+            "title": s.get("title"),
+            "hook": s.get("hook"),
+            "key_data_points": s.get("key_data_points", []),
+            "category": s.get("category"),
+            "tags": s.get("tags", []),
+            "priority": s.get("priority", "medium"),
+            "reason": s.get("reason"),
+            "language": req.language,
+            "status": "pending",
+        })
+
+    if rows:
+        sb.table("article_seeds").insert(rows).execute()
+
+    logger.info("Generated %d article seeds for %s", len(rows), today)
+    return {"count": len(rows), "date": today, "seeds": seeds}
 
 
 @app.post("/content/seeds")
 async def generate_seeds(req: SeedGenerationRequest, _auth=Depends(verify_secret)):
     try:
-        import anthropic
-
-        idx_data = sb_select("index_daily", order="snapshot_date.desc", limit=1)
-        idx = idx_data[0] if idx_data else {}
-
-        hot_data = sb_select(
-            "listings_daily",
-            select="price_usd,source,snapshot_date,products(brand_name,model)",
-            filters={"price_usd": "not.is.null"},
-            order="snapshot_date.desc",
-            limit=200,
-        )
-        hot_summary = _summarize_hot_models(hot_data)
-
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        lang_instr = (
-            "Respond in Japanese." if req.language == "ja" else "Respond in English."
-        )
-
-        prompt = f"""You are the Chief Strategy Officer of GUITAR ATLAS.
-Based on today's ({date.today().isoformat()}) market data, generate {req.num_seeds} article seeds.
-
-## Today's Index Values
-{json.dumps(idx, ensure_ascii=False, indent=2)}
-
-## Hot Models Summary
-{hot_summary}
-
-## Requirements
-Return a JSON array with {req.num_seeds} objects, each with:
-- title: Compelling article title backed by data
-- hook: Lead paragraph (2-3 sentences)
-- key_data_points: Array of 3-5 data points
-- category: One of "gai-e"|"vfi"|"bpi"|"boutique-premium"|"trend"
-- tags: Array from "observed"|"indexed"|"spread"|"forecast"|"field-note"
-- priority: "high"|"medium"|"low"
-- reason: One sentence why this seed was chosen
-
-{lang_instr}
-
-Return ONLY the JSON array. No markdown, no extra text."""
-
-        message = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        raw = message.content[0].text.strip()
-        if "```" in raw:
-            parts = raw.split("```")
-            raw = parts[1] if len(parts) > 1 else parts[0]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        seeds = json.loads(raw.strip())
-
-        today = date.today().isoformat()
-        rows = [
-            {
-                "generated_at": today,
-                "title": s.get("title", ""),
-                "hook": s.get("hook"),
-                "key_data_points": s.get("key_data_points", []),
-                "category": s.get("category", "trend"),
-                "tags": s.get("tags", []),
-                "priority": s.get("priority", "medium"),
-                "reason": s.get("reason"),
-                "language": req.language,
-                "status": "pending",
-            }
-            for s in seeds
-        ]
-        sb_upsert("article_seeds", rows)
-        logger.info("Generated %d article seeds for %s", len(seeds), today)
-
-        return {"success": True, "count": len(seeds), "date": today, "seeds": seeds}
-
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=500, detail=f"Claude JSON parse error: {e}")
+        result = await asyncio.to_thread(_do_generate_seeds, req)
+        return {"success": True, **result}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Seed generation error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# -- Helpers -------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════
+# Stripe Premium routes (TH-07a)
+# ═══════════════════════════════════════════════════════════════════
 
-def _summarize_hot_models(listings: list) -> str:
-    if not listings:
-        return "No listing data available."
-    by_model: dict = defaultdict(list)
-    for row in listings:
-        product = row.get("products") or {}
-        brand = product.get("brand_name", "Unknown")
-        model = product.get("model", "Unknown")
-        key = f"{brand} {model}"
-        if row.get("price_usd"):
-            by_model[key].append(float(row["price_usd"]))
-    lines = []
-    for model_name, prices in sorted(by_model.items(), key=lambda x: -len(x[1]))[:10]:
-        avg = sum(prices) / len(prices)
-        lines.append(f"- {model_name}: avg ${avg:,.0f} ({len(prices)} listings)")
-    return "\n".join(lines) if lines else "No listing data available."
+from routes_stripe import router as stripe_router
+
+app.include_router(stripe_router)
 
 
-# -- Entrypoint ----------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════
+# Dashboard routes (TH-07d)
+# ═══════════════════════════════════════════════════════════════════
+
+from routes_dashboard import router as dashboard_router
+
+app.include_router(dashboard_router)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# エントリーポイント（ローカル開発用）
+# ═══════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=True)
