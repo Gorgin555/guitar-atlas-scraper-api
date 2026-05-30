@@ -24,6 +24,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ── パス解決（同一プロジェクトのコードを参照）──────────────────────────
@@ -84,6 +85,13 @@ app = FastAPI(
     title="GUITAR ATLAS Scraper API",
     description="n8n オーケストレーション用 Python バックエンド",
     version="1.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://theguitaratlas.com"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["accept", "Content-Type"],
 )
 
 
