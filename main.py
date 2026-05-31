@@ -174,7 +174,7 @@ async def fetch_reverb(req: FetchReverbRequest, _auth=Depends(verify_secret)):
 
 class FetchActiveRequest(BaseModel):
     basket: Optional[str] = None       # "MFI" | "VFI" | "BPI" | None（全件）
-    max_pages: int = 3
+    max_pages: int = 1  # TD-007: 600s タイムアウト回避のため日次既定を1ページに (全件は呼出側で明示指定可)
     dry_run: bool = False
     limit_models: Optional[int] = None
     yahoo_mode: str = "active"          # active / sold / both（後方互換）
