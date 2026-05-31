@@ -32,6 +32,7 @@ _HERE = os.path.dirname(__file__)
 _CODE_DIR = os.path.abspath(os.path.join(_HERE, ".."))         # → code/n8n
 _ATLAS_CODE = os.path.abspath(os.path.join(_HERE, "..", ".."))   # → code/
 sys.path.insert(0, _ATLAS_CODE)
+sys.path.insert(0, _HERE)  # TH-06b: 同梱した ingest/reverb/scrapers/index_engine を解決
 
 # .env は Railway では存在しない。ローカル開発時のみ読み込めればよい。
 try:
