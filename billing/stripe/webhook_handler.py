@@ -114,14 +114,40 @@ def _upsert_customer_from_session(sb: Any, session: dict[str, Any]) -> None:
     sb.table("premium_customers").upsert(row, on_conflict="wp_user_id").execute()
 
 
+def _current_period_window(subscription: dict[str, Any]) -> tuple[int | None, int | None]:
+    """Resolve current period boundaries from Subscription or its first SubscriptionItem.
+
+    Stripe API 2024-09-30+ moved current_period_start / current_period_end from the
+    Subscription object to each SubscriptionItem. Pre-2024-09-30 events still expose
+    them at top level, so we fall back from top-level -> first SubscriptionItem to
+    remain compatible with both shapes.
+
+    Returns (start, end) as epoch ints; either may be None on extreme edge cases
+    (caller should treat as schema violation if NOT NULL columns receive None).
+
+    Confirmed root cause of TD-003 (2026-05-31 cancel webhook 500 ERR investigation).
+    """
+    top_start = subscription.get("current_period_start")
+    top_end = subscription.get("current_period_end")
+    if top_start and top_end:
+        return top_start, top_end
+    items = ((subscription.get("items") or {}).get("data") or [])
+    first = items[0] if items else {}
+    return (
+        top_start or first.get("current_period_start"),
+        top_end or first.get("current_period_end"),
+    )
+
+
 def _subscription_row(subscription: dict[str, Any]) -> dict[str, Any]:
+    period_start, period_end = _current_period_window(subscription)
     return {
         "stripe_subscription_id": subscription["id"],
         "stripe_customer_id": subscription["customer"],
         "plan": _plan_from_subscription(subscription),
         "status": subscription["status"],
-        "current_period_start": _ts(subscription.get("current_period_start")),
-        "current_period_end": _ts(subscription.get("current_period_end")),
+        "current_period_start": _ts(period_start),
+        "current_period_end": _ts(period_end),
         "cancel_at_period_end": bool(subscription.get("cancel_at_period_end")),
         "canceled_at": _ts(subscription.get("canceled_at")),
     }
