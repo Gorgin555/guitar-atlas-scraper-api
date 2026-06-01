@@ -152,8 +152,8 @@ class YahooAuctionsScraper(BaseScraper):
         """
         selectors = [
             "li.Product",           # Products list
-            "li.b-list-item",       # variant
             "div.Product",          # div 版
+            "li.b-list-item",       # variant
             ".auction-item",        # 旧型
             "li[data-auction-id]",  # data 属性
             "li[data-auction]",     # data 属性 variant
@@ -187,7 +187,7 @@ class YahooAuctionsScraper(BaseScraper):
                         ".item-title", ".title", "a.auction-title"]:
                 el = item.select_one(sel)
                 if el:
-                    title = el.get_text(strip=True)
+                    title = " ".join(el.get_text(" ", strip=True).split())
                     break
 
             if not title:
@@ -202,13 +202,15 @@ class YahooAuctionsScraper(BaseScraper):
                       or item.get("data-item-id"))
 
             # リンクから URL と ID を取得
-            link = item.select_one("a[href*='yahoo.co.jp']") or item.select_one("a[href]")
+            link = (item.select_one(".Product__titleLink[href]")
+                    or item.select_one("a[href*='/jp/auction/']")
+                    or item.select_one("a[href*='yahoo.co.jp']"))
             if link:
                 href = link.get("href", "")
                 src_url = href if href.startswith("http") else YAHOO_AUCTIONS_BASE + href
                 # URL から auction ID を抽出
-                # 例: /item/a123456789/ → a123456789
-                m = re.search(r"/item/([a-z0-9]+)/?", href)
+                # 例: /jp/auction/a123456789 → a123456789
+                m = re.search(r"/(?:jp/auction|item)/([a-z0-9]+)/?", href)
                 if m and not src_id:
                     src_id = m.group(1)
 
@@ -220,7 +222,7 @@ class YahooAuctionsScraper(BaseScraper):
             buynow_price = None
 
             # 現在の価格（入札価格 or 開始価格）
-            for sel in [".Product__price", ".b-price", ".current-price",
+            for sel in [".Product__priceValue", ".Product__price", ".b-price", ".current-price",
                         "[data-value]", ".price", "span.aucPrice"]:
                 el = item.select_one(sel)
                 if el:
@@ -269,8 +271,8 @@ class YahooAuctionsScraper(BaseScraper):
 
             # ── 出品者 ────────────────────────────────────────────────
             seller_name = None
-            for sel in [".Product__seller", ".seller", ".aucBidder",
-                        "a[href*='/seller/']", ".seller-id"]:
+            for sel in [".Product__sellerName", ".Product__seller a[href*='/seller/']",
+                        ".Product__seller", ".aucBidder", ".seller-id"]:
                 el = item.select_one(sel)
                 if el:
                     seller_name = el.get_text(strip=True)
@@ -301,7 +303,7 @@ class YahooAuctionsScraper(BaseScraper):
             clean_raw = self.strip_images(raw)
 
             return {
-                "source": "yahoo_auctions",
+                "source": "yahoo",
                 "source_listing_id": src_id,
                 "source_url": src_url,
                 "title": title,

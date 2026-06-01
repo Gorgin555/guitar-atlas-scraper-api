@@ -63,6 +63,19 @@ _CONDITION_MAP = {
 
 def _normalize_condition(raw: str) -> str:
     raw_lower = raw.strip().lower()
+    grade_match = re.search(r"(?:状態[:：]\s*)?([sabc][+-]?)(?![a-z])", raw_lower)
+    if grade_match:
+        grade = grade_match.group(1)
+        if grade == "s":
+            return "mint"
+        if grade.startswith("a"):
+            return "excellent"
+        if grade == "b+":
+            return "very_good"
+        if grade.startswith("b"):
+            return "good"
+        if grade.startswith("c"):
+            return "fair"
     for k, v in _CONDITION_MAP.items():
         if k in raw_lower:
             return v
@@ -111,6 +124,7 @@ class DigimartScraper(BaseScraper):
         """
         # 優先順位: 実際の HTML 構造に合わせてチューニングすること
         selectors = [
+            "div.itemSearchBlock.itemSearchListItem",  # 2026-06 search list card
             "div.ds-card",              # デジマート標準カード
             "li.list-item",             # リスト表示
             "article.product-item",     # 記事形式
@@ -127,7 +141,14 @@ class DigimartScraper(BaseScraper):
         price_els = soup.select("span.price, div.price, p.price")
         if price_els:
             logger.debug("Digimart: fallback — found %d price elements", len(price_els))
-            return [p.parent for p in price_els if p.parent]
+            cards = []
+            for price_el in price_els:
+                card = price_el.find_parent(class_="itemSearchBlock")
+                if card and card not in cards:
+                    cards.append(card)
+                elif price_el.parent and price_el.parent not in cards:
+                    cards.append(price_el.parent)
+            return cards
 
         logger.warning("Digimart: no listing cards found on page")
         return []
@@ -140,11 +161,11 @@ class DigimartScraper(BaseScraper):
         try:
             # ── タイトル ─────────────────────────────────────────────
             title = None
-            for sel in ["h3.title", "h2.title", ".item-title", ".product-title",
+            for sel in [".ttl a", ".ttl", "h3.title", "h2.title", ".item-title", ".product-title",
                         "a.item-name", ".name", "h3", "h2"]:
                 el = card.select_one(sel)
                 if el:
-                    title = el.get_text(strip=True)
+                    title = " ".join(el.get_text(" ", strip=True).split())
                     break
 
             if not title:
@@ -153,7 +174,8 @@ class DigimartScraper(BaseScraper):
             # ── URL / 出品 ID ────────────────────────────────────────
             src_url = None
             src_id = None
-            for sel in ["a.item-link", "a.title-link", "a[href*='/cat']", "a[href*='/DS']", "a"]:
+            for sel in [".ttl a[href*='/DS']", "a.item-link", "a.title-link",
+                        "a[href*='/DS']", "a[href*='/cat']", "a"]:
                 link = card.select_one(sel)
                 if link and link.get("href"):
                     href = link["href"]
@@ -165,19 +187,27 @@ class DigimartScraper(BaseScraper):
                     break
 
             if not src_id:
+                m = re.search(r"商品ID[:：]\s*(DS\d+)", card.get_text(" ", strip=True))
+                if m:
+                    src_id = m.group(1)
+
+            if not src_id:
                 # URL が取れなかった場合はタイトルのハッシュを ID 代わりに使う
                 src_id = f"dm_{abs(hash(title)) % 10**10}"
 
             # ── 価格 ──────────────────────────────────────────────────
             price_local = None
-            for sel in [".price", ".selling-price", ".item-price", "span.price",
+            for sel in [".itemState .price", ".price", ".selling-price", ".item-price", "span.price",
                         ".instrument-price", "[data-price]"]:
-                el = card.select_one(sel)
-                if el:
+                for el in card.select(sel):
                     price_text = el.get("data-price") or el.get_text(strip=True)
+                    if "送料" in price_text:
+                        continue
                     price_local = self.parse_jpy(price_text)
                     if price_local:
                         break
+                if price_local:
+                    break
 
             # ── コンディション ────────────────────────────────────────
             condition_raw = None
@@ -187,6 +217,14 @@ class DigimartScraper(BaseScraper):
                 if el:
                     condition_raw = el.get_text(strip=True)
                     break
+            if not condition_raw:
+                m = re.search(r"状態[:：]\s*([A-Za-z][+-]?)", card.get_text(" ", strip=True))
+                if m:
+                    condition_raw = m.group(1)
+            elif "状態" in condition_raw:
+                m = re.search(r"状態[:：]\s*([A-Za-z][+-]?)", condition_raw)
+                if m:
+                    condition_raw = m.group(1)
 
             condition = _normalize_condition(condition_raw) if condition_raw else None
 
@@ -200,11 +238,15 @@ class DigimartScraper(BaseScraper):
                     listed_at = _parse_date(dt_str)
                     if listed_at:
                         break
+            if not listed_at:
+                m = re.search(r"登録[:：]\s*(\d{4}/\d{1,2}/\d{1,2})", card.get_text(" ", strip=True))
+                if m:
+                    listed_at = _parse_date(m.group(1))
 
             # ── 店舗名 ────────────────────────────────────────────────
             seller_name = None
             for sel in [".shop-name", ".store-name", ".seller", ".shop",
-                        "a[href*='/shop/']", ".dealer"]:
+                        "a[href*='shopNo=']", "a[href*='/shop/']", ".dealer"]:
                 el = card.select_one(sel)
                 if el:
                     seller_name = el.get_text(strip=True)
