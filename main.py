@@ -147,7 +147,6 @@ def _do_fetch_reverb(req: FetchReverbRequest) -> dict[str, Any]:
         max_pages=req.max_pages_per_model,
         state="live",
         dry_run=req.dry_run,
-        yahoo_mode=req.yahoo_mode,
     )
     # 既存 CLI の counts キー（targets / listings / errors）→ 共通フォーマットに正規化
     return {
@@ -204,6 +203,7 @@ def _do_run_active(sources: list[str], req: FetchActiveRequest) -> dict[str, Any
         targets=targets,
         max_pages=req.max_pages,
         dry_run=req.dry_run,
+        yahoo_mode=req.yahoo_mode,
     )
     return {
         "targets": counts.get("targets", len(targets)),
