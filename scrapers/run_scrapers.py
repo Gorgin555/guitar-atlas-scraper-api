@@ -121,6 +121,7 @@ def run_active(
     targets: list[dict],
     max_pages: int,
     dry_run: bool,
+    yahoo_mode: str = "both",
 ) -> dict[str, int]:
     """
     58 active モデルに対して各ソースでスクレイピングし listings_daily に upsert。
@@ -161,10 +162,15 @@ def run_active(
                 if source_name == "digimart":
                     gen = scraper.fetch(keyword, max_pages=max_pages)
                 else:  # yahoo
-                    gen_active = scraper.fetch(keyword, mode="active", max_pages=max_pages)
-                    gen_sold = scraper.fetch(keyword, mode="sold", max_pages=1)
-                    import itertools
-                    gen = itertools.chain(gen_active, gen_sold)
+                    if yahoo_mode == "active":
+                        gen = scraper.fetch(keyword, mode="active", max_pages=max_pages)
+                    elif yahoo_mode == "sold":
+                        gen = scraper.fetch(keyword, mode="sold", max_pages=max_pages)
+                    else:
+                        gen_active = scraper.fetch(keyword, mode="active", max_pages=max_pages)
+                        gen_sold = scraper.fetch(keyword, mode="sold", max_pages=1)
+                        import itertools
+                        gen = itertools.chain(gen_active, gen_sold)
 
                 for listing in gen:
                     listing["snapshot_date"] = snapshot_date
