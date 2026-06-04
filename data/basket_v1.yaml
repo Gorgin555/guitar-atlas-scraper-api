@@ -1,0 +1,390 @@
+# GUITAR ATLAS — Phase 1 Basket v1.0
+# 確定日: 2026-05-09
+# 総モデル数: 58 (MFI 18 + VFI 18 + BPI 22)
+# 用途: 自動化スクリプトが直接読込み、Reverb API クエリ生成等に使用
+
+version: "1.0"
+locked_at: "2026-05-09"
+index_base_date: "2026-06-01"
+
+indexes:
+  GAI-E:
+    name: "Guitar Atlas Index - Electric"
+    weights: { MFI: 0.40, VFI: 0.30, BPI: 0.30 }
+
+  MFI:
+    name: "Mainstream Flagship Index"
+    description: "現行新品の動向"
+    model_count: 18
+
+  VFI:
+    name: "Vintage Flagship Index"
+    description: "ヴィンテージ市場の動向"
+    model_count: 18
+    series:
+      - "all_original_only"
+      - "all_conditions"
+
+  BPI:
+    name: "Boutique Premium Index"
+    description: "ブティックの動向"
+    model_count: 22
+
+spreads:
+  boutique_premium:
+    formula: "BPI / MFI"
+    description: "ブティックがフラッグシップに対して何倍プレミアムか"
+
+  vintage_premium:
+    formula: "VFI / MFI"
+    description: "ヴィンテージが現行新品に対して何倍プレミアムか"
+
+  heritage_spread:
+    formula: "VFI / BPI"
+    description: "ヴィンテージがブティックに対して何倍評価されているか"
+
+# ─────────────────────────────────────────────
+# MFI: Mainstream Flagship Index (18 models)
+# ─────────────────────────────────────────────
+
+mfi:
+  fender:
+    - id: M01
+      brand: Fender
+      model: American Vintage II 1957 Stratocaster
+      category: Strat
+    - id: M02
+      brand: Fender
+      model: American Vintage II 1961 Stratocaster
+      category: Strat
+    - id: M03
+      brand: Fender
+      model: American Vintage II 1963 Telecaster
+      category: Tele
+    - id: M04
+      brand: Fender
+      model: Custom Shop 1960 Stratocaster Journeyman Relic
+      category: Strat
+    - id: M05
+      brand: Fender
+      model: Custom Shop Postmodern Stratocaster
+      category: Strat
+    - id: M06
+      brand: Fender
+      model: American Professional II Stratocaster
+      category: Strat
+    - id: M07
+      brand: Fender
+      model: American Ultra Telecaster
+      category: Tele
+
+  gibson:
+    - id: M08
+      brand: Gibson
+      model: Custom Shop Murphy Lab '59 Les Paul Standard
+      category: Les Paul
+    - id: M09
+      brand: Gibson
+      model: Custom Shop Murphy Lab '60 Les Paul Standard
+      category: Les Paul
+    - id: M10
+      brand: Gibson
+      model: Custom Shop Murphy Lab '61 ES-335
+      category: Semi-hollow
+    - id: M11
+      brand: Gibson
+      model: Custom Shop '57 Les Paul Junior
+      category: Junior
+    - id: M12
+      brand: Gibson
+      model: Standard 50s Les Paul
+      category: Les Paul
+    - id: M13
+      brand: Gibson
+      model: SG Standard '61
+      category: SG
+
+  prs:
+    - id: M14
+      brand: PRS
+      model: Custom 24 (Core)
+      category: PRS Core
+    - id: M15
+      brand: PRS
+      model: McCarty 594
+      category: PRS Core
+    - id: M16
+      brand: PRS
+      model: Silver Sky
+      category: Strat-style
+    - id: M17
+      brand: PRS
+      model: Modern Eagle
+      category: PRS High-end
+    - id: M18
+      brand: PRS
+      model: Private Stock
+      category: PRS Custom
+      note: "集計トラッキング（モデル横断）"
+
+# ─────────────────────────────────────────────
+# VFI: Vintage Flagship Index (18 models)
+# ─────────────────────────────────────────────
+
+vfi:
+  fender_vintage:
+    - id: V01
+      brand: Fender
+      model: Pre-CBS Stratocaster
+      year_range: "1954-1959"
+    - id: V02
+      brand: Fender
+      model: Pre-CBS Stratocaster
+      year_range: "1960-1964"
+    - id: V03
+      brand: Fender
+      model: Late CBS Stratocaster
+      year_range: "1965-1969"
+    - id: V04
+      brand: Fender
+      model: "'50s Telecaster"
+      year_range: "1952-1959"
+    - id: V05
+      brand: Fender
+      model: "'60s Telecaster"
+      year_range: "1960-1969"
+    - id: V06
+      brand: Fender
+      model: 1972 Telecaster Thinline
+      year_range: "1971-1978"
+    - id: V07
+      brand: Fender
+      model: American Vintage Reissue '57/'62
+      year_range: "1982-1998"
+    - id: V08
+      brand: Fender
+      model: Custom Shop Early Era
+      year_range: "1987-1995"
+
+  gibson_vintage:
+    - id: V09
+      brand: Gibson
+      model: 'Les Paul Standard "Burst"'
+      year_range: "1958-1960"
+      note: "最高峰、¥3,000万-1億"
+    - id: V10
+      brand: Gibson
+      model: Les Paul Standard Goldtop
+      year_range: "1952-1957"
+    - id: V11
+      brand: Gibson
+      model: Les Paul Junior
+      year_range: "1954-1960"
+    - id: V12
+      brand: Gibson
+      model: SG Standard
+      year_range: "1961-1966"
+    - id: V13
+      brand: Gibson
+      model: ES-335 Dot Neck
+      year_range: "1958-1963"
+    - id: V14
+      brand: Gibson
+      model: ES-335 Block
+      year_range: "1964-1969"
+    - id: V15
+      brand: Gibson
+      model: Norlin Era Les Paul
+      year_range: "1970-1985"
+
+  prs_vintage:
+    - id: V16
+      brand: PRS
+      model: Pre-Factory PRS
+      year_range: "1985-1989"
+    - id: V17
+      brand: PRS
+      model: Early Factory Custom
+      year_range: "1990-1995"
+    - id: V18
+      brand: PRS
+      model: Dragon I/II/III Series
+      year_range: "1992-1994"
+
+# ─────────────────────────────────────────────
+# BPI: Boutique Premium Index (22 models)
+# ─────────────────────────────────────────────
+
+bpi:
+  suhr:
+    - id: B01
+      brand: Suhr
+      model: Classic S Antique SSS
+    - id: B02
+      brand: Suhr
+      model: Classic S Antique HSS
+    - id: B03
+      brand: Suhr
+      model: Standard
+    - id: B04
+      brand: Suhr
+      model: Modern Plus
+    - id: B05
+      brand: Suhr
+      model: Classic T Antique
+
+  tom_anderson:
+    - id: B06
+      brand: Tom Anderson
+      model: Drop Top Classic
+    - id: B07
+      brand: Tom Anderson
+      model: Icon Classic
+    - id: B08
+      brand: Tom Anderson
+      model: T Icon
+    - id: B09
+      brand: Tom Anderson
+      model: Hollow Drop Top
+
+  knaggs:
+    - id: B10
+      brand: Knaggs
+      model: Severn Tier 2
+    - id: B11
+      brand: Knaggs
+      model: Choptank Tier 2
+    - id: B12
+      brand: Knaggs
+      model: Kenai T1
+
+  james_tyler:
+    - id: B13
+      brand: James Tyler
+      model: Studio Elite HD
+    - id: B14
+      brand: James Tyler
+      model: Mongoose Special
+    - id: B15
+      brand: James Tyler
+      model: Classic
+    - id: B16
+      brand: James Tyler
+      model: Variax Custom
+
+  don_grosh:
+    - id: B17
+      brand: Don Grosh
+      model: Set-Neck Bent Top
+    - id: B18
+      brand: Don Grosh
+      model: ElectraJet Custom
+    - id: B19
+      brand: Don Grosh
+      model: Retro Classic
+
+  asher:
+    - id: B20
+      brand: Asher
+      model: Electro Sonic
+    - id: B21
+      brand: Asher
+      model: T Deluxe
+
+  tausch:
+    - id: B22
+      brand: Tausch
+      model: 665 Standard
+
+# ─────────────────────────────────────────────
+# Vintage Condition Tags（自動付与）
+# ─────────────────────────────────────────────
+
+condition_tags:
+  - tag: all_original
+    description: 全オリジナル
+    price_impact: "100% baseline"
+  - tag: partial_changed
+    description: 一部交換
+    price_impact: "-10 to -20%"
+  - tag: refin
+    description: リフィニッシュ
+    price_impact: "-20 to -40%"
+  - tag: replaced_neck
+    description: ネック交換
+    price_impact: "-50% or more"
+  - tag: parts_caster
+    description: パーツ寄せ集め
+    price_impact: "個別査定"
+  - tag: case_present
+    description: 純正ケース付属
+    price_impact: "+5%"
+  - tag: paperwork_present
+    description: ハングタグ・書類完備
+    price_impact: "+10%"
+
+# ─────────────────────────────────────────────
+# 受動的収集対象（Phase 1中、記録のみ）
+# ─────────────────────────────────────────────
+
+passive_collection:
+  pedals:
+    note: "Phase 2 で PAI として正式発表"
+    brands_to_track:
+      - Klon (Centaur, KTR)
+      - Strymon (Timeline, BigSky, Volante etc.)
+      - Empress
+      - JHS
+      - Mad Professor
+      - Bondi Effects
+      - EarthQuaker Devices
+      - Walrus Audio
+      - Universal Audio (UAFX)
+      - Chase Bliss
+      - 一五一会 / Free The Tone
+      - Vemuram
+      - Effects Bakery
+      - Limetone Audio
+      - Mojo Hand FX
+      - Spaceman Effects
+      - Caroline Guitar Co.
+      - Old Blood Noise Endeavors
+      - Greer Amps
+      - ZVEX Effects
+
+  acoustic:
+    note: "Phase 3 で AAI として正式発表"
+    brands_to_track:
+      - Pre-war Martin (D-28, 000-28, OM-28)
+      - Collings
+      - Bourgeois
+      - Olson
+      - McPherson
+      - Goodall
+      - Lowden
+      - Yokoyama
+      - Asturias
+      - Headway
+
+  amps:
+    note: "Phase 4 で AmpAI として正式発表"
+    brands_to_track:
+      - Two-Rock
+      - Dr. Z
+      - Friedman
+      - Bogner
+      - Suhr Amps
+      - Komet
+      - 65amps
+      - Matchless
+      - Carr
+      - Morgan
+
+  jbi_japan_boutique:
+    note: "Phase 2 で JBI として正式発表"
+    brands_to_track:
+      - T's Guitars
+      - Saito Guitars
+      - Momose
+      - Bacchus Handmade
+      - Crews

@@ -33,8 +33,46 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-# basket_v1.yaml のパス
-BASKET_YAML = Path(__file__).parents[2] / "memory" / "data" / "basket_v1.yaml"
+# basket_v1.yaml のパス解決
+# ローカル開発 (ATLAS/code/scrapers/) と Railway デプロイ (repo root に scrapers/) の
+# 両レイアウトに対応するため、複数候補を順に探索する。
+# 明示上書きが必要な場合は env BASKET_YAML_PATH を設定する。
+def _resolve_basket_yaml() -> Path:
+    here = Path(__file__).resolve()
+    candidates: list[Path] = []
+    env_path = os.environ.get("BASKET_YAML_PATH")
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates += [
+        here.parents[2] / "memory" / "data" / "basket_v1.yaml",  # ローカル: ATLAS/memory/data
+        here.parents[1] / "memory" / "data" / "basket_v1.yaml",
+        here.parents[1] / "data" / "basket_v1.yaml",
+        here.parent / "basket_v1.yaml",
+    ]
+    cwd = Path.cwd()
+    candidates += [
+        cwd / "memory" / "data" / "basket_v1.yaml",
+        cwd / "data" / "basket_v1.yaml",
+        cwd / "basket_v1.yaml",
+    ]
+    for c in candidates:
+        try:
+            if c.is_file():
+                return c
+        except OSError:
+            continue
+    raise FileNotFoundError(
+        "basket_v1.yaml が見つかりません。探索候補: "
+        + ", ".join(str(c) for c in candidates)
+        + "。env BASKET_YAML_PATH で明示指定するか、デプロイ repo に data/basket_v1.yaml を配置してください。"
+    )
+
+
+# 後方互換の定数 (解決失敗時は None、実際の読み込みは _load_basket で都度解決)。
+try:
+    BASKET_YAML: Optional[Path] = _resolve_basket_yaml()
+except FileNotFoundError:
+    BASKET_YAML = None
 
 # カテゴリごとの検索キーワード補完
 # （ブランド名だけでは広すぎる場合に絞り込むキーワードを付与）
@@ -64,7 +102,8 @@ class PassiveCollector:
     # ── basket_v1.yaml 読み込み ───────────────────────────────────────────
 
     def _load_basket(self) -> dict:
-        with open(BASKET_YAML, encoding="utf-8") as f:
+        path = _resolve_basket_yaml()  # 都度解決 (デプロイ後の配置/ env 反映を確実に拾う)
+        with open(path, encoding="utf-8") as f:
             return yaml.safe_load(f)
 
     def get_passive_targets(self) -> list[dict[str, str]]:

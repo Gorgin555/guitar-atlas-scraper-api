@@ -32,7 +32,6 @@ _HERE = os.path.dirname(__file__)
 _CODE_DIR = os.path.abspath(os.path.join(_HERE, ".."))         # → code/n8n
 _ATLAS_CODE = os.path.abspath(os.path.join(_HERE, "..", ".."))   # → code/
 sys.path.insert(0, _ATLAS_CODE)
-sys.path.insert(0, _HERE)  # TH-06b: 同梱した ingest/reverb/scrapers/index_engine を解決
 
 # .env は Railway では存在しない。ローカル開発時のみ読み込めればよい。
 try:
@@ -94,6 +93,7 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["accept", "Content-Type"],
 )
+
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -421,7 +421,19 @@ def _summarize_hot_models(listings: list[dict]) -> str:
     from collections import defaultdict
     by_model: dict[str, list[float]] = defaultdict(list)
     for row in listings:
-        key = f"{row.get('brand_name') or row.get('brand') or '?'} {row.get('model','?')}"
+        # products 埋め込み (to-one) は dict、念のため list 形も許容。
+        prod = row.get("products") or {}
+        if isinstance(prod, list):
+            prod = prod[0] if prod else {}
+        brand = prod.get("brand_name") if isinstance(prod, dict) else None
+        model = prod.get("model") if isinstance(prod, dict) else None
+        # 後方互換: 旧構造でトップレベルに brand_name/model がある場合も拾う。
+        brand = brand or row.get("brand_name") or row.get("brand")
+        model = model or row.get("model")
+        if not brand or not model:
+            # product 未マッチの listing はホットモデル集計から除外。
+            continue
+        key = f"{brand} {model}"
         if row.get("price_usd"):
             try:
                 by_model[key].append(float(row["price_usd"]))
@@ -465,7 +477,9 @@ def _do_generate_seeds(req: SeedGenerationRequest) -> dict[str, Any]:
 
     hot_resp = (
         sb.table("listings_daily")
-        .select("brand_name, model, price_usd, source, snapshot_date")
+        # brand_name / model は listings_daily に存在しない (products 側にある)。
+        # product_id FK 経由で products.brand_name / products.model を埋め込む。
+        .select("price_usd, source, snapshot_date, products(brand_name, model)")
         .order("snapshot_date", desc=True)
         .limit(200)
         .execute()
@@ -505,7 +519,8 @@ def _do_generate_seeds(req: SeedGenerationRequest) -> dict[str, Any]:
 JSONの配列として{req.num_seeds}本分のみ返してください。余計な説明不要。"""
 
     message = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-opus-4-6",  # 2026-06-02 Sonnet 全廃 (モデル原則 v2.1, CEO 承認)。旧: claude-sonnet-4-6
+
         max_tokens=2048,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -572,6 +587,10 @@ app.include_router(stripe_router)
 from routes_dashboard import router as dashboard_router
 
 app.include_router(dashboard_router)
+
+from routes_cultural import router as cultural_router
+
+app.include_router(cultural_router)
 
 
 # ═══════════════════════════════════════════════════════════════════
