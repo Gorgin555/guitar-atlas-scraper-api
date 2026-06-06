@@ -14,14 +14,10 @@ Supabase listings_daily に upsert する。
   出品中: https://auctions.yahoo.co.jp/search/search
           ?p={keyword}
           &va={keyword}
-          &mode=0             # all listings
           &exflg=1            # exact phrase
           &b=1                # offset
-          &n=50               # per page
-          &s1=cbids           # sort by bid count
-          &o1=d               # descending
 
-  終了済: ?mode=2 (sold/completed auctions)
+  終了済: Phase 1 defer (robots /closedsearch/ strict)
 
 ■ HTML セレクター（2026-05 時点）
   Yahoo Auctions は server-side rendering。
@@ -113,22 +109,20 @@ class YahooAuctionsScraper(BaseScraper):
     def _search_url(
         self, keyword: str, mode: str = "active", page: int = 1, per_page: int = 50
     ) -> str:
-        # b= は offset (1, 51, 101, ...)
+        # b= は offset (1, 51, 101, ...)。per_page は互換用に受けるが、
+        # robots Disallow 対象の n= は URL に付与しない。
         offset = (page - 1) * per_page + 1
         params = {
             "p": keyword,
             "va": keyword,
             "exflg": "1",
             "b": str(offset),
-            "n": str(per_page),
-            "s1": "new",   # 新着順
-            "o1": "d",
         }
-        # 出品中 vs 終了済みで異なる mode パラメータ
         if mode == "sold":
-            params["mode"] = "2"   # 終了済み
-        else:
-            params["mode"] = "0"   # 出品中
+            raise ScraperError(
+                "Yahoo sold collection is deferred in Phase 1 (robots /closedsearch/ strict). "
+                "See memory/legal/yahoo_robots_clo_ruling_2026-06-05.md."
+            )
 
         return f"{YAHOO_AUCTIONS_BASE}/search/search?{urlencode(params, quote_via=quote)}"
 
@@ -152,8 +146,8 @@ class YahooAuctionsScraper(BaseScraper):
         """
         selectors = [
             "li.Product",           # Products list
-            "div.Product",          # div 版
             "li.b-list-item",       # variant
+            "div.Product",          # div 版
             ".auction-item",        # 旧型
             "li[data-auction-id]",  # data 属性
             "li[data-auction]",     # data 属性 variant
@@ -187,7 +181,7 @@ class YahooAuctionsScraper(BaseScraper):
                         ".item-title", ".title", "a.auction-title"]:
                 el = item.select_one(sel)
                 if el:
-                    title = " ".join(el.get_text(" ", strip=True).split())
+                    title = el.get_text(strip=True)
                     break
 
             if not title:
@@ -202,15 +196,13 @@ class YahooAuctionsScraper(BaseScraper):
                       or item.get("data-item-id"))
 
             # リンクから URL と ID を取得
-            link = (item.select_one(".Product__titleLink[href]")
-                    or item.select_one("a[href*='/jp/auction/']")
-                    or item.select_one("a[href*='yahoo.co.jp']"))
+            link = item.select_one("a[href*='yahoo.co.jp']") or item.select_one("a[href]")
             if link:
                 href = link.get("href", "")
                 src_url = href if href.startswith("http") else YAHOO_AUCTIONS_BASE + href
                 # URL から auction ID を抽出
-                # 例: /jp/auction/a123456789 → a123456789
-                m = re.search(r"/(?:jp/auction|item)/([a-z0-9]+)/?", href)
+                # 例: /item/a123456789/ → a123456789
+                m = re.search(r"/item/([a-z0-9]+)/?", href)
                 if m and not src_id:
                     src_id = m.group(1)
 
@@ -222,7 +214,7 @@ class YahooAuctionsScraper(BaseScraper):
             buynow_price = None
 
             # 現在の価格（入札価格 or 開始価格）
-            for sel in [".Product__priceValue", ".Product__price", ".b-price", ".current-price",
+            for sel in [".Product__price", ".b-price", ".current-price",
                         "[data-value]", ".price", "span.aucPrice"]:
                 el = item.select_one(sel)
                 if el:
@@ -271,8 +263,8 @@ class YahooAuctionsScraper(BaseScraper):
 
             # ── 出品者 ────────────────────────────────────────────────
             seller_name = None
-            for sel in [".Product__sellerName", ".Product__seller a[href*='/seller/']",
-                        ".Product__seller", ".aucBidder", ".seller-id"]:
+            for sel in [".Product__seller", ".seller", ".aucBidder",
+                        "a[href*='/seller/']", ".seller-id"]:
                 el = item.select_one(sel)
                 if el:
                     seller_name = el.get_text(strip=True)
@@ -303,7 +295,7 @@ class YahooAuctionsScraper(BaseScraper):
             clean_raw = self.strip_images(raw)
 
             return {
-                "source": "yahoo",
+                "source": "yahoo_auctions",
                 "source_listing_id": src_id,
                 "source_url": src_url,
                 "title": title,
