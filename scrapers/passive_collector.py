@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -232,7 +232,7 @@ class PassiveCollector:
         if categories:
             targets = [t for t in targets if t["category"] in categories]
 
-        snapshot_date = datetime.now(timezone.utc).astimezone().date().isoformat()
+        snapshot_date = datetime.now(timezone(timedelta(hours=9))).date().isoformat()  # JST (Asia/Tokyo) 明示, tzdata/TZ env 非依存
         counts = {"total_listings": 0, "errors": 0}
 
         for target in targets:

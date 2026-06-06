@@ -26,7 +26,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Iterable, Optional
 
 from dotenv import load_dotenv
@@ -175,7 +175,7 @@ def fetch_and_upsert(
 ) -> dict[str, int]:
     sb = get_supabase()
     client = ReverbClient.from_env()
-    snapshot_date = datetime.now(timezone.utc).astimezone().date().isoformat()
+    snapshot_date = datetime.now(timezone(timedelta(hours=9))).date().isoformat()  # JST (Asia/Tokyo) 明示, tzdata/TZ env 非依存
     counts = {"targets": 0, "listings": 0, "errors": 0}
 
     for t in targets:
@@ -224,6 +224,107 @@ def fetch_and_upsert(
         except Exception as e:
             counts["errors"] += 1
             logger.exception("  ✗ Unexpected error for %s: %r", t.basket_id, e)
+
+    return counts
+
+
+def _brand_query(brand_name: str) -> str:
+    return " ".join((brand_name or "").split())
+
+
+def load_live_brand_targets(limit: int | None = None) -> list[Target]:
+    """
+    Load brand-level live tracker products without touching basket_v1 membership.
+    """
+    sb = get_supabase()
+    res = (
+        sb.table("products")
+        .select("product_id, basket_id, brand_name, model, year_range_str, ingestion_priority, basket_membership(basket)")
+        .eq("is_live_observed", True)
+        .order("ingestion_priority", desc=False)
+        .execute()
+    )
+    rows = res.data or []
+    targets: list[Target] = []
+    for row in rows:
+        memberships = row.get("basket_membership") or []
+        if memberships:
+            continue
+        targets.append(Target(
+            product_id=row["product_id"],
+            basket_id=row.get("basket_id") or "LW",
+            brand_name=row["brand_name"],
+            model=row["model"],
+            year_range_str=row.get("year_range_str"),
+            basket=None,
+        ))
+    if limit:
+        targets = targets[:limit]
+    return targets
+
+
+def fetch_and_upsert_live_brands(
+    targets: Iterable[Target],
+    *,
+    per_page: int = 50,
+    max_pages: int = 2,
+    state: str = "live",
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """
+    Fetch Reverb listings for brand-level live tracker products.
+    """
+    sb = get_supabase()
+    client = ReverbClient.from_env()
+    snapshot_date = datetime.now(timezone(timedelta(hours=9))).date().isoformat()
+    counts = {"targets": 0, "listings": 0, "errors": 0}
+    seen: set[tuple[str, str]] = set()
+
+    for target in targets:
+        counts["targets"] += 1
+        query = _brand_query(target.brand_name)
+        logger.info("[Live Brand] %-3s %s", target.basket_id, query)
+        try:
+            rows = []
+            for listing in client.search_listings(
+                query=query, state=state, per_page=per_page, max_pages=max_pages,
+            ):
+                row = _to_row(target, listing, snapshot_date)
+                row["matched_confidence"] = 0.70
+                rows.append(row)
+
+            if rows:
+                deduped: list[dict[str, Any]] = []
+                dropped = 0
+                for row in rows:
+                    key = (row.get("source_listing_id") or "", row.get("snapshot_date") or "")
+                    if key in seen:
+                        dropped += 1
+                        continue
+                    seen.add(key)
+                    deduped.append(row)
+                rows = deduped
+                if dropped:
+                    logger.debug("  live brand dedupe: dropped %d duplicate rows", dropped)
+
+            if dry_run:
+                counts["listings"] += len(rows)
+                logger.info("  [dry-run] %d listings (not inserted)", len(rows))
+                continue
+
+            if rows:
+                sb.table("listings_daily").upsert(
+                    rows,
+                    on_conflict="source,source_listing_id,snapshot_date",
+                ).execute()
+                counts["listings"] += len(rows)
+            logger.info("  -> upserted %d listings", len(rows))
+        except ReverbAPIError as e:
+            counts["errors"] += 1
+            logger.warning("  x Reverb error for %s: %s", target.basket_id, e)
+        except Exception as e:
+            counts["errors"] += 1
+            logger.exception("  x Unexpected error for %s: %r", target.basket_id, e)
 
     return counts
 

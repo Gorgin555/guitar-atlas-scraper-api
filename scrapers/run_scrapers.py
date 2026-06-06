@@ -41,7 +41,7 @@ import argparse
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -145,7 +145,7 @@ def run_active(
         logger.warning("Could not load ProductCatalog: %s — confidence will be 0.80", e)
         catalog = None
 
-    snapshot_date = datetime.now(timezone.utc).astimezone().date().isoformat()
+    snapshot_date = datetime.now(timezone(timedelta(hours=9))).date().isoformat()  # JST (Asia/Tokyo) 明示, tzdata/TZ env 非依存
     counts = {"targets": 0, "listings": 0, "errors": 0}
 
     for target in targets:
@@ -196,6 +196,100 @@ def run_active(
                 logger.info(
                     "  [%s] → %d listings upserted", source_name, upserted
                 )
+
+            except Exception as e:
+                counts["errors"] += 1
+                logger.warning("  [%s] error for %s: %s", source_name, target["basket_id"], e)
+
+    return counts
+
+
+def _live_brand_keyword(target: dict) -> str:
+    return " ".join((target.get("brand_name") or "").split())
+
+
+def _load_live_brand_targets(limit: int | None = None) -> list[dict]:
+    """
+    products テーブルから brand-level live tracker を取得する。
+    """
+    sb = _get_supabase()
+    res = (
+        sb.table("products")
+        .select("product_id, basket_id, brand_name, model, year_range_str, ingestion_priority, basket_membership(basket)")
+        .eq("is_live_observed", True)
+        .order("ingestion_priority", desc=False)
+        .execute()
+    )
+    rows = res.data or []
+    targets = []
+    for row in rows:
+        memberships = row.get("basket_membership") or []
+        if memberships:
+            continue
+        targets.append({
+            "product_id": row["product_id"],
+            "basket_id": row.get("basket_id") or "LW",
+            "brand_name": row["brand_name"],
+            "model": row["model"],
+            "year_range_str": row.get("year_range_str"),
+            "basket": None,
+        })
+    if limit:
+        targets = targets[:limit]
+    return targets
+
+
+def run_active_live_brands(
+    sources: list[str],
+    targets: list[dict],
+    max_pages: int,
+    dry_run: bool,
+) -> dict[str, int]:
+    """
+    Digimart collection for brand-level live tracker products.
+    """
+    from .digimart import DigimartScraper
+
+    logger = logging.getLogger(__name__)
+    active_sources = [source for source in sources if source == "digimart"]
+    scrapers: dict[str, object] = {}
+    if "digimart" in active_sources:
+        scrapers["digimart"] = DigimartScraper()
+
+    snapshot_date = datetime.now(timezone(timedelta(hours=9))).date().isoformat()
+    counts = {"targets": 0, "listings": 0, "errors": 0}
+    seen: set[tuple[str, str, str]] = set()
+
+    for target in targets:
+        counts["targets"] += 1
+        keyword = _live_brand_keyword(target)
+        logger.info(
+            "[Live Brand] %-3s %s -> '%s'",
+            target["basket_id"], target["brand_name"], keyword,
+        )
+
+        for source_name, scraper in scrapers.items():
+            rows_to_upsert = []
+            try:
+                gen = scraper.fetch(keyword, max_pages=max_pages)
+                for listing in gen:
+                    listing["snapshot_date"] = snapshot_date
+                    listing["product_id"] = target["product_id"]
+                    listing["matched_confidence"] = 0.55
+
+                    key = (
+                        source_name,
+                        str(listing.get("source_listing_id") or ""),
+                        snapshot_date,
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows_to_upsert.append(listing)
+
+                upserted = _upsert_rows(rows_to_upsert, dry_run)
+                counts["listings"] += upserted
+                logger.info("  [%s] -> %d listings upserted", source_name, upserted)
 
             except Exception as e:
                 counts["errors"] += 1
