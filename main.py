@@ -156,6 +156,31 @@ def _do_fetch_reverb(req: FetchReverbRequest) -> dict[str, Any]:
     }
 
 
+def _do_fetch_reverb_live(req: FetchReverbRequest) -> dict[str, Any]:
+    from ingest.fetch_listings import fetch_and_upsert_live_brands, load_live_brand_targets
+
+    targets = load_live_brand_targets(limit=req.limit_models)
+    if not targets:
+        return {"targets": 0, "inserted": 0, "errors": 0, "note": "no targets"}
+
+    fields_set = getattr(req, "model_fields_set", None)
+    if fields_set is None:
+        fields_set = getattr(req, "__fields_set__", set())
+    max_pages = req.max_pages_per_model if "max_pages_per_model" in fields_set else 2
+    counts = fetch_and_upsert_live_brands(
+        targets,
+        per_page=50,
+        max_pages=max_pages,
+        state="live",
+        dry_run=req.dry_run,
+    )
+    return {
+        "targets": counts.get("targets", len(targets)),
+        "inserted": counts.get("listings", 0),
+        "errors": counts.get("errors", 0),
+    }
+
+
 @app.post("/fetch/reverb")
 async def fetch_reverb(req: FetchReverbRequest, _auth=Depends(verify_secret)):
     """Reverb API → listings_daily upsert。既存 fetch_and_upsert に委譲。"""
@@ -165,6 +190,77 @@ async def fetch_reverb(req: FetchReverbRequest, _auth=Depends(verify_secret)):
         return {"source": "reverb", "success": True, **result}
     except Exception as e:
         logger.error("Reverb fetch error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/fetch/reverb/live_brands")
+async def fetch_reverb_live_brands(req: FetchReverbRequest, _auth=Depends(verify_secret)):
+    """Reverb API -> brand-level live tracker products."""
+    try:
+        result = await asyncio.to_thread(_do_fetch_reverb_live, req)
+        logger.info("Reverb live brand fetch complete: %s", result)
+        return {"source": "reverb", "scope": "live_brands", "success": True, **result}
+    except Exception as e:
+        logger.error("Reverb live brand fetch error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class FetchPriceGuideRequest(BaseModel):
+    basket: Optional[str] = None
+    since: Optional[str] = None
+    backfill_months: int = 12
+    max_guides_per_model: int = 8
+    dry_run: bool = False
+    limit_models: Optional[int] = None
+
+
+def _priceguide_subtract_months(base: date, months: int) -> date:
+    import calendar
+
+    month_index = base.year * 12 + (base.month - 1) - months
+    year = month_index // 12
+    month = month_index % 12 + 1
+    day = min(base.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def _do_fetch_priceguide(req: FetchPriceGuideRequest) -> dict[str, Any]:
+    from ingest.fetch_listings import load_targets
+    from ingest.fetch_priceguide import fetch_and_upsert_priceguide
+
+    targets = load_targets(
+        basket=_reverb_basket_arg(req.basket or ""),
+        limit=req.limit_models,
+    )
+    if not targets:
+        return {"targets": 0, "inserted": 0, "errors": 0, "note": "no targets"}
+
+    since = date.fromisoformat(req.since) if req.since else _priceguide_subtract_months(
+        date.today(), req.backfill_months
+    )
+    counts = fetch_and_upsert_priceguide(
+        targets,
+        since=since,
+        max_guides_per_model=req.max_guides_per_model,
+        dry_run=req.dry_run,
+    )
+    return {
+        "targets": counts.get("targets", len(targets)),
+        "guides": counts.get("guides", 0),
+        "inserted": counts.get("transactions", 0),
+        "errors": counts.get("errors", 0),
+    }
+
+
+@app.post("/fetch/priceguide")
+async def fetch_priceguide(req: FetchPriceGuideRequest, _auth=Depends(verify_secret)):
+    """Reverb Price Guide transactions -> priceguide_transactions upsert."""
+    try:
+        result = await asyncio.to_thread(_do_fetch_priceguide, req)
+        logger.info("Price Guide fetch complete: %s", result)
+        return {"source": "priceguide", "success": True, **result}
+    except Exception as e:
+        logger.error("Price Guide fetch error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -212,6 +308,26 @@ def _do_run_active(sources: list[str], req: FetchActiveRequest) -> dict[str, Any
     }
 
 
+def _do_run_active_live(sources: list[str], req: FetchActiveRequest) -> dict[str, Any]:
+    from scrapers.run_scrapers import _load_live_brand_targets, run_active_live_brands
+
+    targets = _load_live_brand_targets(limit=req.limit_models)
+    if not targets:
+        return {"targets": 0, "inserted": 0, "errors": 0, "note": "no targets"}
+
+    counts = run_active_live_brands(
+        sources=sources,
+        targets=targets,
+        max_pages=req.max_pages,
+        dry_run=req.dry_run,
+    )
+    return {
+        "targets": counts.get("targets", len(targets)),
+        "inserted": counts.get("listings", 0),
+        "errors": counts.get("errors", 0),
+    }
+
+
 @app.post("/fetch/digimart")
 async def fetch_digimart(req: FetchActiveRequest, _auth=Depends(verify_secret)):
     """デジマート → listings_daily upsert。"""
@@ -221,6 +337,18 @@ async def fetch_digimart(req: FetchActiveRequest, _auth=Depends(verify_secret)):
         return {"source": "digimart", "success": True, **result}
     except Exception as e:
         logger.error("Digimart fetch error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/fetch/digimart/live_brands")
+async def fetch_digimart_live_brands(req: FetchActiveRequest, _auth=Depends(verify_secret)):
+    """Digimart -> brand-level live tracker products."""
+    try:
+        result = await asyncio.to_thread(_do_run_active_live, ["digimart"], req)
+        logger.info("Digimart live brand fetch complete: %s", result)
+        return {"source": "digimart", "scope": "live_brands", "success": True, **result}
+    except Exception as e:
+        logger.error("Digimart live brand fetch error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

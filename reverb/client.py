@@ -229,3 +229,99 @@ def _safe_json(resp: requests.Response) -> Any:
         return resp.json()
     except ValueError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Price Guide methods (TH-06e)
+# ---------------------------------------------------------------------------
+
+def search_price_guides(
+    self: ReverbClient,
+    *,
+    query: Optional[str] = None,
+    make: Optional[str] = None,
+    model: Optional[str] = None,
+    per_page: int = 24,
+    max_pages: int = 1,
+) -> Iterator[dict[str, Any]]:
+    """GET /priceguide and yield price_guides[] with guarded paging."""
+    params: dict[str, Any] = {
+        "per_page": per_page,
+        "page": 1,
+    }
+    if query:
+        params["query"] = query
+    if make:
+        params["make"] = make
+    if model:
+        params["model"] = model
+
+    next_url: Optional[str] = None
+    page_count = 0
+
+    while page_count < max_pages:
+        if next_url:
+            payload = self._request("GET", next_url)
+        else:
+            payload = self._request("GET", "/priceguide", params=params)
+
+        for item in payload.get("price_guides") or []:
+            yield item
+
+        page_count += 1
+
+        links = payload.get("_links") or {}
+        next_link = links.get("next") or {}
+        next_url = next_link.get("href")
+        if next_url:
+            continue
+
+        current_page = int(payload.get("current_page") or params.get("page") or page_count)
+        total_pages = int(payload.get("total_pages") or current_page)
+        if current_page >= total_pages:
+            break
+        params["page"] = current_page + 1
+
+
+def get_price_guide_transactions(
+    self: ReverbClient,
+    guide_id: int | str,
+    *,
+    per_page: int = 50,
+    max_pages: int = 2,
+) -> Iterator[dict[str, Any]]:
+    """GET /priceguide/{guide_id}/transactions and yield transaction rows."""
+    params: dict[str, Any] = {
+        "per_page": per_page,
+        "page": 1,
+    }
+    next_url: Optional[str] = None
+    page_count = 0
+
+    while page_count < max_pages:
+        if next_url:
+            payload = self._request("GET", next_url)
+        else:
+            payload = self._request("GET", f"/priceguide/{guide_id}/transactions", params=params)
+
+        rows = payload.get("transactions") or payload.get("price_guide_transactions") or []
+        for item in rows:
+            yield item
+
+        page_count += 1
+
+        links = payload.get("_links") or {}
+        next_link = links.get("next") or {}
+        next_url = next_link.get("href")
+        if next_url:
+            continue
+
+        current_page = int(payload.get("current_page") or params.get("page") or page_count)
+        total_pages = int(payload.get("total_pages") or current_page)
+        if current_page >= total_pages:
+            break
+        params["page"] = current_page + 1
+
+
+ReverbClient.search_price_guides = search_price_guides
+ReverbClient.get_price_guide_transactions = get_price_guide_transactions
