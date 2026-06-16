@@ -670,23 +670,39 @@ def _do_generate_seeds(req: SeedGenerationRequest) -> dict[str, Any]:
 
 {lang_instruction}
 
+# 出力の厳密ルール（必ず守る）
+- 厳密にパース可能な **JSON 配列のみ**を返す。前後に説明文・マークダウン・コードフェンスを付けない。
+- 文字列値の中では半角ダブルクオート(")を使わない。引用・強調は日本語引用符「」『』または波ダッシュ——で表現する。
+- 末尾カンマを付けない。改行や特殊記号は正しくエスケープする。
+
 JSON の配列として {req.num_seeds} 本分のみ返してください。余計な説明は不要です。"""
 
-    message = client.messages.create(
-        model="claude-opus-4-6",  # 2026-06-02 Sonnet 全廃 (モデル原則 v2.1, CEO 承認)。旧: claude-sonnet-4-6
+    # TD: 新プロンプト (文化観測機トーン) はモデルが値内に生のダブルクオートを入れて
+    # JSON が壊れる確率があるため、JSON パース失敗時は最大 3 回まで自動リトライする。
+    seeds = None
+    last_err = None
+    for attempt in range(3):
+        message = client.messages.create(
+            model="claude-opus-4-6",  # 2026-06-02 Sonnet 全廃 (モデル原則 v2.1, CEO 承認)。旧: claude-sonnet-4-6
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = message.content[0].text
+        try:
+            parsed = json.loads(_strip_code_fence(raw))
+        except json.JSONDecodeError as e:
+            last_err = f"JSON parse error: {e}"
+            logger.warning("seed gen attempt %d/3 failed: %s\nraw=%r", attempt + 1, last_err, raw[:300])
+            continue
+        if not isinstance(parsed, list):
+            last_err = "response is not a JSON array"
+            logger.warning("seed gen attempt %d/3: %s", attempt + 1, last_err)
+            continue
+        seeds = parsed
+        break
 
-        max_tokens=2048,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = message.content[0].text
-    try:
-        seeds = json.loads(_strip_code_fence(raw))
-    except json.JSONDecodeError as e:
-        logger.error("Claude returned invalid JSON: %s\nraw=%r", e, raw[:500])
-        raise HTTPException(status_code=502, detail=f"Claude JSON parse error: {e}")
-
-    if not isinstance(seeds, list):
-        raise HTTPException(status_code=502, detail="Claude response is not a JSON array")
+    if seeds is None:
+        raise HTTPException(status_code=502, detail=f"Claude seed generation failed after 3 attempts: {last_err}")
 
     # TD-018: JST (UTC+9) 明示採番。tzdata 非依存。
     # 旧 date.today() は Railway コンテナの UTC 採番 → 6/8 06:00 JST 実行分が
